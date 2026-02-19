@@ -547,7 +547,8 @@ def call_async(coro):
     """Быстрый вызов async функции из GUI потока"""
     try:
         if hasattr(bot, 'loop') and bot.loop and bot.loop.is_running():
-            # Используем call_soon_threadsafe для более быстрой реакции
+            # Используем run_coroutine_threadsafe для немедленного выполнения
+            # Это планирует корутину на выполнение в event loop бота
             future = asyncio.run_coroutine_threadsafe(coro, bot.loop)
             # Не ждем результат, чтобы не блокировать GUI
             return future
@@ -780,8 +781,17 @@ class ChannelsWindow(QWidget):
             if id_start > 4 and id_end > id_start:
                 channel_id = int(text[id_start:id_end])
                 
-                call_async(bot.set_current_channel(channel_id))
-                call_async(bot.connect_to_channel())
+                # Немедленно обновляем GUI родительского окна, если оно есть
+                if self.parent_panel:
+                    self.parent_panel.status.setText("Подключение к каналу...")
+                    QApplication.processEvents()
+                
+                # Объединяем вызовы в одну корутину для синхронного выполнения
+                async def connect_sequence():
+                    await bot.set_current_channel(channel_id)
+                    await bot.connect_to_channel()
+                
+                call_async(connect_sequence())
         except (ValueError, IndexError):
             QMessageBox.warning(self, "Ошибка", "Не удалось определить ID канала!")
 
@@ -947,6 +957,12 @@ class TracksWindow(QWidget):
         """Воспроизводит выбранный трек"""
         item = self.tracks_list.currentItem()
         if item:
+            # Немедленно обновляем GUI родительского окна, если оно есть
+            if self.parent_panel:
+                track_name = item.text().split(" [")[0]
+                self.parent_panel.status.setText(f"Загрузка: {track_name}...")
+                QApplication.processEvents()
+            
             # Получаем полный путь из данных элемента
             track_path = item.data(Qt.ItemDataRole.UserRole)
             if track_path:
@@ -1175,38 +1191,58 @@ class Panel(QWidget):
         """Применяет тему и фоновое изображение"""
         bg_image = CONFIG.get("background_image", "")
         
+        # Проверяем, существует ли файл, если нет - очищаем настройку
+        if bg_image and not os.path.exists(bg_image):
+            # Файл не найден, очищаем настройку
+            CONFIG["background_image"] = ""
+            json.dump(CONFIG, open(CONFIG_PATH, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
+            bg_image = ""
+        
         if bg_image and os.path.exists(bg_image):
-            # Загружаем изображение для масштабирования
-            self.background_pixmap = QPixmap(bg_image)
-            # Применяем стили для виджетов
-            self.setStyleSheet("""
-            QPushButton {
-                background: rgba(51, 51, 51, 200);
-                padding: 8px;
-                border: 1px solid rgba(255, 255, 255, 100);
-                color: white;
-            }
-            QLabel {
-                background: rgba(30, 30, 30, 150);
-                color: white;
-            }
-            QSlider {
-                background: rgba(30, 30, 30, 150);
-            }
-            QListWidget {
-                background: rgba(30, 30, 30, 200);
-                color: white;
-            }
-            """)
-            # Обновляем виджет для перерисовки
-            self.update()
-        else:
-            # Стандартная тема без фона
-            self.background_pixmap = None
-            self.setStyleSheet("""
-            QWidget {background:#1e1e1e;color:white}
-            QPushButton {background:#333;padding:8px}
-            """)
+            try:
+                # Загружаем изображение для масштабирования
+                self.background_pixmap = QPixmap(bg_image)
+                if self.background_pixmap.isNull():
+                    # Не удалось загрузить изображение
+                    self.background_pixmap = None
+                    CONFIG["background_image"] = ""
+                    json.dump(CONFIG, open(CONFIG_PATH, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
+                else:
+                    # Применяем стили для виджетов
+                    self.setStyleSheet("""
+                    QPushButton {
+                        background: rgba(51, 51, 51, 200);
+                        padding: 8px;
+                        border: 1px solid rgba(255, 255, 255, 100);
+                        color: white;
+                    }
+                    QLabel {
+                        background: rgba(30, 30, 30, 150);
+                        color: white;
+                    }
+                    QSlider {
+                        background: rgba(30, 30, 30, 150);
+                    }
+                    QListWidget {
+                        background: rgba(30, 30, 30, 200);
+                        color: white;
+                    }
+                    """)
+                    # Обновляем виджет для перерисовки
+                    self.update()
+                    return
+            except Exception as e:
+                print(f"[WARNING] Не удалось загрузить фоновое изображение: {e}")
+                self.background_pixmap = None
+                CONFIG["background_image"] = ""
+                json.dump(CONFIG, open(CONFIG_PATH, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
+        
+        # Стандартная тема без фона
+        self.background_pixmap = None
+        self.setStyleSheet("""
+        QWidget {background:#1e1e1e;color:white}
+        QPushButton {background:#333;padding:8px}
+        """)
     
     def paintEvent(self, event):
         """Отрисовывает фоновое изображение с масштабированием"""
@@ -1229,6 +1265,9 @@ class Panel(QWidget):
 
 
     def stop(self):
+        # Немедленно обновляем GUI
+        self.status.setText("Остановка...")
+        QApplication.processEvents()
         call_async(bot.stop_music())
 
 
@@ -1243,7 +1282,9 @@ class Panel(QWidget):
 
     def disconnect_from_channel(self):
         """Отключается от голосового канала"""
-        self.status.setText("Отключение от канала...")
+        # Немедленно обновляем GUI
+        self.status.setText("Отключение...")
+        QApplication.processEvents()
         call_async(bot.disconnect_from_channel())
 
 
@@ -1259,14 +1300,23 @@ class Panel(QWidget):
         # Устанавливаем флаг ручного управления
         self.pause_manual_control = True
         
+        # Немедленно обновляем GUI для быстрой реакции
         if checked:
             # Ставим на паузу
             self.pause_btn.setText("▶ ПРОДОЛЖИТЬ")
-            call_async(bot.pause_music())
-            self.status.setText("Пауза")
+            self.status.setText("Пауза...")
         else:
             # Возобновляем
             self.pause_btn.setText("⏸ ПАУЗА")
+            self.status.setText("Воспроизведение...")
+        
+        # Принудительно обновляем GUI
+        QApplication.processEvents()
+        
+        # Вызываем async функцию
+        if checked:
+            call_async(bot.pause_music())
+        else:
             call_async(bot.resume_music())
         
         # Сбрасываем флаг через небольшую задержку, чтобы timerEvent не перезаписывал состояние
@@ -1297,32 +1347,40 @@ class Panel(QWidget):
         )
         
         if file:
-            # Копируем изображение в папку с exe для сохранения
-            bg_dir = _abs("backgrounds")
-            os.makedirs(bg_dir, exist_ok=True)
-            bg_filename = os.path.basename(file)
-            bg_path = os.path.join(bg_dir, bg_filename)
-            shutil.copy(file, bg_path)
-            
-            # Сохраняем путь в конфиг
-            CONFIG["background_image"] = bg_path
-            json.dump(CONFIG, open(CONFIG_PATH, "w", encoding="utf-8"), indent=2)
-            
-            # Применяем тему
-            self.apply_theme()
-            
-            # Обновляем окна, если они открыты
-            if self.channels_window:
-                self.channels_window.apply_theme()
-            if self.tracks_window:
-                self.tracks_window.apply_theme()
-            
-            self.status.setText(f"Фон установлен: {bg_filename}")
+            try:
+                # Копируем изображение в папку с exe для сохранения
+                bg_dir = _abs("backgrounds")
+                os.makedirs(bg_dir, exist_ok=True)
+                bg_filename = os.path.basename(file)
+                bg_path = os.path.join(bg_dir, bg_filename)
+                
+                # Если файл уже существует, удаляем старый
+                if os.path.exists(bg_path):
+                    os.remove(bg_path)
+                
+                shutil.copy(file, bg_path)
+                
+                # Сохраняем абсолютный путь в конфиг для надежности
+                CONFIG["background_image"] = os.path.abspath(bg_path)
+                json.dump(CONFIG, open(CONFIG_PATH, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
+                
+                # Применяем тему
+                self.apply_theme()
+                
+                # Обновляем окна, если они открыты
+                if self.channels_window:
+                    self.channels_window.apply_theme()
+                if self.tracks_window:
+                    self.tracks_window.apply_theme()
+                
+                self.status.setText(f"Фон установлен: {bg_filename}")
+            except Exception as e:
+                QMessageBox.warning(self, "Ошибка", f"Не удалось установить фон: {e}")
 
     def remove_background(self):
         """Убирает фоновое изображение"""
         CONFIG["background_image"] = ""
-        json.dump(CONFIG, open(CONFIG_PATH, "w", encoding="utf-8"), indent=2)
+        json.dump(CONFIG, open(CONFIG_PATH, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
         self.apply_theme()
         
         # Обновляем окна, если они открыты
