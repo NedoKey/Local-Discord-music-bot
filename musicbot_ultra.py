@@ -2,7 +2,7 @@ import sys
 import os
 import json
 import asyncio
-import sys
+import time
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -131,6 +131,11 @@ queue = []
 current = None
 
 volume = CONFIG["volume"] / 100
+
+# Кеш для списка треков (обновляется при изменении папок)
+_tracks_cache = None
+_tracks_cache_time = 0
+CACHE_TTL = 5  # Кеш действителен 5 секунд
 
 # Режим бесконечного повтора текущего трека
 repeat_enabled = False
@@ -326,13 +331,12 @@ async def next_track():
 
     try:
         # Приводим звук к 48 kHz стерео PCM, как ожидает Discord.
-        # Это помогает избавиться от "битого" / искажённого звука.
-        # Упрощенные настройки FFmpeg для стабильной работы
+        # Оптимизированные настройки FFmpeg для плавного воспроизведения без пролагов
         ffmpeg_source = discord.FFmpegPCMAudio(
             path,
             executable=FFMPEG,
-            before_options="-nostdin",
-            options="-vn -ac 2 -ar 48000"
+            before_options="-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 2",
+            options="-vn -ac 2 -ar 48000 -f s16le -bufsize 512k -thread_queue_size 512"
         )
         # На всякий случай ограничим громкость до 1.0, чтобы избежать клиппинга.
         safe_volume = max(0.0, min(1.0, volume))
@@ -351,8 +355,16 @@ async def next_track():
     print("[playback] now playing:", current)
 
 
-def get_all_tracks():
-    """Получает список всех треков из всех папок"""
+def get_all_tracks(force_refresh=False):
+    """Получает список всех треков из всех папок с кешированием"""
+    global _tracks_cache, _tracks_cache_time
+    
+    current_time = time.time()
+    
+    # Используем кеш, если он еще действителен и не требуется принудительное обновление
+    if not force_refresh and _tracks_cache is not None and (current_time - _tracks_cache_time) < CACHE_TTL:
+        return _tracks_cache
+    
     tracks = []
     folders = CONFIG.get("music_folders", [])
     
@@ -364,15 +376,20 @@ def get_all_tracks():
         if os.path.exists(folder):
             try:
                 for f in os.listdir(folder):
-                    if f.endswith(".mp3"):
+                    if f.lower().endswith(".mp3"):  # case-insensitive
                         full_path = os.path.join(folder, f)
-                        tracks.append({
-                            "name": f,
-                            "path": full_path,
-                            "folder": folder
-                        })
+                        if os.path.isfile(full_path):  # Проверяем, что это файл
+                            tracks.append({
+                                "name": f,
+                                "path": full_path,
+                                "folder": folder
+                            })
             except Exception as e:
                 print(f"[WARNING] Ошибка при чтении папки {folder}: {e}")
+    
+    # Обновляем кеш
+    _tracks_cache = tracks
+    _tracks_cache_time = current_time
     
     return tracks
 
@@ -544,20 +561,21 @@ bot.disconnect_from_channel = disconnect
 
 # Вспомогательная функция для быстрого вызова async функций из GUI
 def call_async(coro):
-    """Быстрый вызов async функции из GUI потока"""
+    """Быстрый вызов async функции из GUI потока с немедленным планированием"""
     try:
         if hasattr(bot, 'loop') and bot.loop and bot.loop.is_running():
-            # Используем run_coroutine_threadsafe для немедленного выполнения
-            # Это планирует корутину на выполнение в event loop бота
-            future = asyncio.run_coroutine_threadsafe(coro, bot.loop)
-            # Не ждем результат, чтобы не блокировать GUI
-            return future
+            # Используем call_soon_threadsafe для немедленного планирования
+            # Это быстрее, чем run_coroutine_threadsafe, так как не создает Future
+            bot.loop.call_soon_threadsafe(
+                lambda: asyncio.create_task(coro, loop=bot.loop)
+            )
+            return True
         else:
             print("[WARNING] Bot loop не доступен, попытка выполнить позже...")
-            return None
+            return False
     except Exception as e:
         print(f"[ERROR] Ошибка при вызове async функции: {e}")
-        return None
+        return False
 
 
 def run_bot():
@@ -784,7 +802,8 @@ class ChannelsWindow(QWidget):
                 # Немедленно обновляем GUI родительского окна, если оно есть
                 if self.parent_panel:
                     self.parent_panel.status.setText("Подключение к каналу...")
-                    QApplication.processEvents()
+                    # Используем минимальное обновление только для статуса
+                    QApplication.processEvents(QApplication.ProcessEventsFlag.ExcludeUserInputEvents)
                 
                 # Объединяем вызовы в одну корутину для синхронного выполнения
                 async def connect_sequence():
@@ -831,7 +850,7 @@ class TracksWindow(QWidget):
         folders_buttons.addWidget(remove_folder_btn)
         
         refresh_btn = QPushButton("🔄 Обновить")
-        refresh_btn.clicked.connect(self.load_tracks)
+        refresh_btn.clicked.connect(self.refresh_tracks)
         folders_buttons.addWidget(refresh_btn)
         
         close_folders_btn = QPushButton("✕ Закрыть")
@@ -931,9 +950,10 @@ class TracksWindow(QWidget):
             self.folders_list.addItem(folder)
     
     def load_tracks(self):
-        """Загружает список треков из всех папок"""
+        """Загружает список треков из всех папок с использованием кеша"""
         self.tracks_list.clear()
-        tracks = get_all_tracks()
+        # Используем кеш для быстрой загрузки
+        tracks = get_all_tracks(force_refresh=False)
         
         # Группируем по папкам для удобства
         folders_dict = {}
@@ -953,6 +973,13 @@ class TracksWindow(QWidget):
                 item = self.tracks_list.item(self.tracks_list.count() - 1)
                 item.setData(Qt.ItemDataRole.UserRole, track["path"])
     
+    def refresh_tracks(self):
+        """Принудительно обновляет список треков"""
+        # Очищаем кеш и загружаем заново
+        global _tracks_cache
+        _tracks_cache = None
+        self.load_tracks()
+    
     def play(self):
         """Воспроизводит выбранный трек"""
         item = self.tracks_list.currentItem()
@@ -961,7 +988,8 @@ class TracksWindow(QWidget):
             if self.parent_panel:
                 track_name = item.text().split(" [")[0]
                 self.parent_panel.status.setText(f"Загрузка: {track_name}...")
-                QApplication.processEvents()
+                # Используем минимальное обновление только для статуса
+                QApplication.processEvents(QApplication.ProcessEventsFlag.ExcludeUserInputEvents)
             
             # Получаем полный путь из данных элемента
             track_path = item.data(Qt.ItemDataRole.UserRole)
@@ -1131,7 +1159,8 @@ class Panel(QWidget):
 
         self.apply_theme()
 
-        self.startTimer(500)
+        # Увеличиваем интервал таймера для уменьшения нагрузки на CPU
+        self.startTimer(1000)  # Обновление раз в секунду вместо 500мс
 
 
     def timerEvent(self, e):
@@ -1267,7 +1296,8 @@ class Panel(QWidget):
     def stop(self):
         # Немедленно обновляем GUI
         self.status.setText("Остановка...")
-        QApplication.processEvents()
+        # Используем минимальное обновление только для статуса
+        QApplication.processEvents(QApplication.ProcessEventsFlag.ExcludeUserInputEvents)
         call_async(bot.stop_music())
 
 
@@ -1284,7 +1314,8 @@ class Panel(QWidget):
         """Отключается от голосового канала"""
         # Немедленно обновляем GUI
         self.status.setText("Отключение...")
-        QApplication.processEvents()
+        # Используем минимальное обновление только для статуса
+        QApplication.processEvents(QApplication.ProcessEventsFlag.ExcludeUserInputEvents)
         call_async(bot.disconnect_from_channel())
 
 
@@ -1310,8 +1341,8 @@ class Panel(QWidget):
             self.pause_btn.setText("⏸ ПАУЗА")
             self.status.setText("Воспроизведение...")
         
-        # Принудительно обновляем GUI
-        QApplication.processEvents()
+        # Принудительно обновляем GUI (только для статуса, без обработки пользовательского ввода)
+        QApplication.processEvents(QApplication.ProcessEventsFlag.ExcludeUserInputEvents)
         
         # Вызываем async функцию
         if checked:
