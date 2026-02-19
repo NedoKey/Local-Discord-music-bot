@@ -331,28 +331,42 @@ async def next_track():
 
     try:
         # Приводим звук к 48 kHz стерео PCM, как ожидает Discord.
-        # Оптимизированные настройки FFmpeg для плавного воспроизведения без пролагов
+        # Оптимизированные настройки FFmpeg для локальных файлов
+        # Убраны опции reconnect (они для потоков, не для локальных файлов)
         ffmpeg_source = discord.FFmpegPCMAudio(
             path,
             executable=FFMPEG,
-            before_options="-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 2",
-            options="-vn -ac 2 -ar 48000 -f s16le -bufsize 512k -thread_queue_size 512"
+            before_options="-nostdin",
+            options="-vn -ac 2 -ar 48000 -f s16le -bufsize 512k"
         )
         # На всякий случай ограничим громкость до 1.0, чтобы избежать клиппинга.
         safe_volume = max(0.0, min(1.0, volume))
         source = discord.PCMVolumeTransformer(ffmpeg_source, volume=safe_volume)
     except Exception as e:
         print("[playback] failed to create FFmpeg source:", repr(e))
+        print(f"[playback] Error details: {type(e).__name__}: {e}")
         await next_track()
         return
 
-    voice.play(
-        source,
-        after=lambda e: asyncio.run_coroutine_threadsafe(
-            next_track(), bot.loop
+    # Проверяем, что voice клиент готов к воспроизведению
+    if not voice or not voice.is_connected():
+        print("[playback] Voice client не подключен")
+        current = None
+        return
+
+    try:
+        voice.play(
+            source,
+            after=lambda e: asyncio.run_coroutine_threadsafe(
+                next_track(), bot.loop
+            ) if bot.loop and bot.loop.is_running() else None
         )
-    )
-    print("[playback] now playing:", current)
+        print("[playback] now playing:", current)
+    except Exception as e:
+        print(f"[playback] failed to start playback: {repr(e)}")
+        print(f"[playback] Error details: {type(e).__name__}: {e}")
+        await next_track()
+        return
 
 
 def get_all_tracks(force_refresh=False):
@@ -408,6 +422,7 @@ async def play(track_path_or_name):
     # Если передан полный путь, используем его
     if os.path.exists(track_path_or_name):
         queue.append(track_path_or_name)
+        print(f"[INFO] Трек добавлен в очередь: {os.path.basename(track_path_or_name)}")
     else:
         # Ищем трек по имени во всех папках
         tracks = get_all_tracks()
@@ -419,12 +434,17 @@ async def play(track_path_or_name):
         
         if found:
             queue.append(found)
+            print(f"[INFO] Трек добавлен в очередь: {track_path_or_name}")
         else:
             print(f"[ERROR] Трек '{track_path_or_name}' не найден в папках")
             return
 
-    if not voice.is_playing():
+    # Запускаем воспроизведение, если ничего не играет
+    if not voice.is_playing() and not voice.is_paused():
+        print("[INFO] Запуск воспроизведения...")
         await next_track()
+    else:
+        print(f"[INFO] Трек добавлен в очередь. Текущий трек: {current}")
 
 
 async def stop():
@@ -561,21 +581,19 @@ bot.disconnect_from_channel = disconnect
 
 # Вспомогательная функция для быстрого вызова async функций из GUI
 def call_async(coro):
-    """Быстрый вызов async функции из GUI потока с немедленным планированием"""
+    """Быстрый вызов async функции из GUI потока"""
     try:
         if hasattr(bot, 'loop') and bot.loop and bot.loop.is_running():
-            # Используем call_soon_threadsafe для немедленного планирования
-            # Это быстрее, чем run_coroutine_threadsafe, так как не создает Future
-            bot.loop.call_soon_threadsafe(
-                lambda: asyncio.create_task(coro, loop=bot.loop)
-            )
-            return True
+            # Используем run_coroutine_threadsafe для надежного выполнения
+            future = asyncio.run_coroutine_threadsafe(coro, bot.loop)
+            # Не ждем результат, чтобы не блокировать GUI
+            return future
         else:
             print("[WARNING] Bot loop не доступен, попытка выполнить позже...")
-            return False
+            return None
     except Exception as e:
         print(f"[ERROR] Ошибка при вызове async функции: {e}")
-        return False
+        return None
 
 
 def run_bot():
@@ -802,8 +820,8 @@ class ChannelsWindow(QWidget):
                 # Немедленно обновляем GUI родительского окна, если оно есть
                 if self.parent_panel:
                     self.parent_panel.status.setText("Подключение к каналу...")
-                    # Используем минимальное обновление только для статуса
-                    QApplication.processEvents(QApplication.ProcessEventsFlag.ExcludeUserInputEvents)
+                    # Обновляем GUI без блокировки пользовательского ввода
+                    QApplication.processEvents()
                 
                 # Объединяем вызовы в одну корутину для синхронного выполнения
                 async def connect_sequence():
@@ -988,8 +1006,8 @@ class TracksWindow(QWidget):
             if self.parent_panel:
                 track_name = item.text().split(" [")[0]
                 self.parent_panel.status.setText(f"Загрузка: {track_name}...")
-                # Используем минимальное обновление только для статуса
-                QApplication.processEvents(QApplication.ProcessEventsFlag.ExcludeUserInputEvents)
+                # Обновляем GUI без блокировки пользовательского ввода
+                QApplication.processEvents()
             
             # Получаем полный путь из данных элемента
             track_path = item.data(Qt.ItemDataRole.UserRole)
@@ -1296,8 +1314,7 @@ class Panel(QWidget):
     def stop(self):
         # Немедленно обновляем GUI
         self.status.setText("Остановка...")
-        # Используем минимальное обновление только для статуса
-        QApplication.processEvents(QApplication.ProcessEventsFlag.ExcludeUserInputEvents)
+        QApplication.processEvents()
         call_async(bot.stop_music())
 
 
@@ -1314,8 +1331,7 @@ class Panel(QWidget):
         """Отключается от голосового канала"""
         # Немедленно обновляем GUI
         self.status.setText("Отключение...")
-        # Используем минимальное обновление только для статуса
-        QApplication.processEvents(QApplication.ProcessEventsFlag.ExcludeUserInputEvents)
+        QApplication.processEvents()
         call_async(bot.disconnect_from_channel())
 
 
@@ -1341,8 +1357,8 @@ class Panel(QWidget):
             self.pause_btn.setText("⏸ ПАУЗА")
             self.status.setText("Воспроизведение...")
         
-        # Принудительно обновляем GUI (только для статуса, без обработки пользовательского ввода)
-        QApplication.processEvents(QApplication.ProcessEventsFlag.ExcludeUserInputEvents)
+        # Принудительно обновляем GUI
+        QApplication.processEvents()
         
         # Вызываем async функцию
         if checked:
