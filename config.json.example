@@ -1,0 +1,11 @@
+{
+  "volume": 50,
+  "channels": [
+    {
+      "id": 0,
+      "name": "Пример канала"
+    }
+  ],
+  "background_image": "",
+  "music_folders": []
+}
